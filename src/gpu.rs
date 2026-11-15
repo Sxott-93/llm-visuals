@@ -330,7 +330,7 @@ const XPU_QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.
 /// instantaneous deltas.
 struct XeSample {
     idle_ms: u64,       // sum of gt{0,1}/gtidle/idle_residency_ms
-    energy_mj: u64,     // energy1_input from hwmon (mJ)
+    energy_uj: u64,     // energy1_input from hwmon (μJ)
     ts: Instant,
 }
 
@@ -563,8 +563,7 @@ impl GpuMonitor {
     }
 
     /// Delta-based power draw from hwmon energy counters.
-    /// `energy1_input` is total card energy in mJ.  Delta between two
-    /// polls gives mJ / s = mW.
+    /// `energy1_input` is total card energy in μJ (microjoules).
     /// First call after process start returns `None`.
     fn xe_power_watts(index: u32, prev: &Option<XeSample>, now: Instant) -> Option<f32> {
         let map = Self::xe_bdf_map();
@@ -584,24 +583,24 @@ impl GpuMonitor {
             })
             .map(|entry| entry.path().join("energy1_input"))?;
         let content = std::fs::read_to_string(&e_path).ok()?;
-        let energy_mj = content.trim().split_whitespace().next()
+        let energy_uj = content.trim().split_whitespace().next()
             .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
 
         if prev.is_none() {
             return None; // first sample: just cache
         }
         let prev = prev.as_ref().unwrap();
-        let delta_mj = if energy_mj >= prev.energy_mj {
-            energy_mj - prev.energy_mj
+        let delta_uj = if energy_uj >= prev.energy_uj {
+            energy_uj - prev.energy_uj
         } else {
             // Counter wrapped.
-            u64::MAX - prev.energy_mj + energy_mj
+            u64::MAX - prev.energy_uj + energy_uj
         };
         let delta_s = now.duration_since(prev.ts).as_secs_f32();
         if delta_s < 0.05 {
             return None;
         }
-        Some(delta_mj as f32 / delta_s) // mW
+        Some(delta_uj as f32 / delta_s / 1_000_000.0) // μJ / s / 1e6 = W
     }
 
     /// Intel GPUs via xpu-smi, with sysfs patching for fields that return
@@ -640,7 +639,7 @@ impl GpuMonitor {
                 .join(&bdf)
                 .join("hwmon");
             // Find the xe hwmonN subdirectory and read energy1_input.
-            let energy_mj = std::fs::read_dir(&hwmon)
+            let energy_uj = std::fs::read_dir(&hwmon)
                 .ok()
                 .and_then(|dir| {
                     dir.filter_map(|e| e.ok())
@@ -658,7 +657,7 @@ impl GpuMonitor {
                 .unwrap_or(0);
             (Some(bdf), Some(XeSample {
                 idle_ms,
-                energy_mj,
+                energy_uj,
                 ts: now,
             }))
         } else {
