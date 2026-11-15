@@ -698,7 +698,7 @@ impl GpuMonitor {
                 if g.power_watts < 0.5 {
                     if let Some(pw) = Self::xe_power_watts(g.index, &prev, now) {
                         if pw > 0.5 {
-                            g.power_watts = pw / 1000.0; // mW → W
+                            g.power_watts = pw; // already in W
                         }
                     }
                 }
