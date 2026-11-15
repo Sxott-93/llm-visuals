@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -209,15 +210,26 @@ pub struct GpuMonitor {
     backend: Arc<GpuBackend>,
 }
 
-pub enum GpuBackend {
-    Nvml(Arc<NvmlSession>),
-    NvidiaSmi,
-    Xpu,
-    Amd(Vec<AmdDevice>),
-    /// Apple Silicon: privileged `powermetrics` when it is actually usable
-    /// (running as root, or passwordless `sudo -n`), else a long-lived
-    /// sudoless `macmon pipe` stream, else metadata-only.
-    Apple(AppleSource),
+/// Multi-backend GPU collector: holds every backend that has at least one
+/// GPU on the host, so a system with both NVIDIA and Intel (or AMD, or
+/// Apple Silicon) gets all cards on the panel instead of the first winner.
+///
+/// Detection runs NVIDIA → Intel → AMD → Apple in that order. Indices are
+/// assigned in the same order: the first backend's GPUs start at 0, the
+/// second's start at the first backend's count, and so on. This matches the
+/// way drivers enumerate — NVML indices 0..N for NVIDIA, then xpu-smi
+/// indices shifted by N for Intel, etc.
+pub struct GpuBackend {
+    /// NVML session for NVIDIA GPUs. The primary backend when present.
+    pub nvml: Option<Arc<NvmlSession>>,
+    /// Fallback: nvidia-smi for NVIDIA (used only when NVML is absent).
+    nvidia_smi: bool,
+    /// Intel GPU via xpu-smi.
+    xpu: bool,
+    /// AMD GPUs via sysfs.
+    amd: Vec<AmdDevice>,
+    /// Apple Silicon GPU (macOS only).
+    apple: Option<AppleSource>,
 }
 
 /// What the Apple backend polls, decided once at detection time.
@@ -313,6 +325,15 @@ fn nvidia_csv(
 /// N/A on current Intel drivers and parse as 0/None.
 const XPU_QUERY: &str = "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.current.graphics,clocks.max.graphics,clocks.current.media,fan.speed,pcie.link.gen.current,pcie.link.width.current";
 
+/// Sample of the xe sysfs counters needed for delta-based util and
+/// power computation.  Cached between polls so we can compute
+/// instantaneous deltas.
+struct XeSample {
+    idle_ms: u64,       // sum of gt{0,1}/gtidle/idle_residency_ms
+    energy_mj: u64,     // energy1_input from hwmon (mJ)
+    ts: Instant,
+}
+
 impl GpuMonitor {
     pub fn new(backend: Arc<GpuBackend>) -> Self {
         Self {
@@ -388,9 +409,308 @@ impl GpuMonitor {
         }
     }
 
-    /// Intel GPUs via xpu-smi, same field order as NVIDIA_QUERY.
+    /// Parse `xpu-smi discovery` output into an index → name map.
+    /// xpu-smi --query-gpu returns "N/A" for the name field on some cards
+    /// (Arc B70 class); discovery lists the real names.
+    fn xpu_gpu_names() -> HashMap<u32, String> {
+        let mut map: HashMap<u32, String> = HashMap::new();
+        // First, get the list of valid indices from --query-gpu.
+        let Ok(out) = run_smi("xpu-smi", "--query-gpu=index") else { return map; };
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Some(index_str) = line.split(',').next() {
+                if let Ok(idx) = index_str.trim().parse::<u32>() {
+                    map.insert(idx, String::new()); // sentinel for "seen"
+                }
+            }
+        }
+        // Now read the discovery table for names.
+        // Discovery format: "<idx>  Device Name: <name>" (name on the same line
+        // as the index), followed by other properties on subsequent lines.
+        let output = std::process::Command::new("xpu-smi")
+            .args(["discovery"])
+            .output();
+        let Ok(out2) = output else { return map; };
+        let table = String::from_utf8_lossy(&out2.stdout);
+        let mut current_idx: Option<u32> = None;
+        for line in table.lines() {
+            let line = line.trim();
+            // Device header line: starts with a number followed by whitespace.
+            if let Some(idx_str) = line.split_whitespace().next() {
+                if let Ok(idx) = idx_str.parse::<u32>() {
+                    // Validate against previously seen indices to skip noise.
+                    if map.contains_key(&idx) {
+                        current_idx = Some(idx);
+                        // The device name may be on this same line:
+                        // "<idx>  Device Name: <name>"
+                        if let Some(rest) = line.find("Device Name:").and_then(|i| line.get(i + 12..)) {
+                            let name = rest.trim();
+                            if !name.is_empty() {
+                                map.insert(idx, name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // "Device Name:" line also appears on its own line in some versions.
+            if let Some(name) = line.strip_prefix("Device Name:") {
+                if let Some(idx) = current_idx {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        map.insert(idx, name.to_string());
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    // ---------- Intel xe sysfs helpers ----------
+
+    /// Map each xpu-smi index to the BDF (e.g. "0000:05:00.0") of its xe
+    /// hwmon directory.  xpu-smi returns indices in ascending PCI BDF order,
+    /// so reading all hwmon entries that say "xe" and sorting by BDF gives
+    /// the same order.
+    fn xe_bdf_map() -> HashMap<u32, String> {
+        let mut cards: Vec<(String, u32)> = Vec::new();
+        let Ok(hwmons) = std::fs::read_dir("/sys/class/hwmon") else { return HashMap::new(); };
+        for entry in hwmons.filter_map(|e| e.ok()) {
+            let name = match std::fs::read_to_string(entry.path().join("name")) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => continue,
+            };
+            if name != "xe" {
+                continue;
+            }
+            // `device` is a symlink to the PCI device (e.g. ../../../0000:05:00.0).
+            let bdf = entry.path()
+                .join("device")
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|b| b.to_string_lossy().into_owned()));
+            if let Some(bdf) = bdf {
+                cards.push((bdf, cards.len() as u32));
+            }
+        }
+        cards.sort_by_key(|(bdf, _)| bdf.clone());
+        cards.into_iter().enumerate().map(|(i, (bdf, _))| (i as u32, bdf)).collect()
+    }
+
+    /// Read package temperature from the xe hwmon entry, °C.  The pkg
+    /// sensor is `temp2_input`; the vram sensor is `temp3_input`.
+    fn xe_temp_c(index: u32) -> Option<f32> {
+        let map = Self::xe_bdf_map();
+        let bdf = map.get(&index)?;
+        let hwmon = Path::new("/sys/bus/pci/devices")
+            .join(bdf)
+            .join("hwmon");
+        // hwmon/ contains hwmonN directories; find the one with name="xe".
+        let Ok(hwmon_dir) = std::fs::read_dir(&hwmon) else { return None; };
+        let mut found = false;
+        let mut temp_path = None;
+        for entry in hwmon_dir.filter_map(|e| e.ok()) {
+            if let Ok(name) = std::fs::read_to_string(entry.path().join("name")) {
+                if name.trim() == "xe" {
+                    temp_path = Some(entry.path().join("temp2_input"));
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        let content = std::fs::read_to_string(temp_path?).ok()?;
+        let millideg = content.trim().split_whitespace().next()?.parse::<u32>().ok()?;
+        (millideg > 0).then(|| millideg as f32 / 1000.0)
+    }
+
+    /// Delta-based GPU utilization from gtidle counters.  xpu-smi reports
+    /// instantaneous tile utilization (~0 between short decode kernels),
+    /// so we measure from the kernel's own idle-residency counters instead.
+    ///
+    /// Two samples are needed for a delta; the first call after process
+    /// start returns `None` (just stores the first sample).
+    fn xe_utilization_gtidle(index: u32, prev: &Option<XeSample>, now: Instant) -> Option<f32> {
+        // Read current gtidle counters (sum over all GTs in tile0).
+        let map = Self::xe_bdf_map();
+        let bdf = map.get(&index)?;
+        let tile0 = Path::new("/sys/bus/pci/devices")
+            .join(bdf)
+            .join("tile0");
+        let mut idle_ms: u64 = 0;
+        for gt_dir in ["gt0", "gt1"] {
+            let p = tile0.join(gt_dir).join("gtidle/idle_residency_ms");
+            if let Ok(s) = std::fs::read_to_string(p) {
+                idle_ms += s.trim().split_whitespace().next()
+                    .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            }
+        }
+        // First sample: store and return 0.0.
+        if prev.is_none() {
+            return Some(0.0);
+        }
+        let prev = prev.as_ref().unwrap();
+        let delta_idle_ms = idle_ms.wrapping_sub(prev.idle_ms) as f32;
+        let delta_total_ms = now.duration_since(prev.ts).as_millis() as f32;
+        if delta_total_ms < 10.0 {
+            return if prev.idle_ms > 0 { Some(0.0) } else { None };
+        }
+        let idle_pct = delta_idle_ms / delta_total_ms;
+        // Clamp 0..100.
+        Some((1.0 - idle_pct).clamp(0.0, 1.0) * 100.0)
+    }
+
+    /// Delta-based power draw from hwmon energy counters.
+    /// `energy1_input` is total card energy in mJ.  Delta between two
+    /// polls gives mJ / s = mW.
+    /// First call after process start returns `None`.
+    fn xe_power_watts(index: u32, prev: &Option<XeSample>, now: Instant) -> Option<f32> {
+        let map = Self::xe_bdf_map();
+        let bdf = map.get(&index)?;
+        let hwmon = Path::new("/sys/bus/pci/devices")
+            .join(bdf)
+            .join("hwmon");
+        // Find the hwmonN subdirectory whose name is "xe".
+        let e_path = std::fs::read_dir(&hwmon)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|entry| {
+                std::fs::read_to_string(entry.path().join("name"))
+                    .ok()
+                    .map(|n| n.trim() == "xe")
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.path().join("energy1_input"))?;
+        let content = std::fs::read_to_string(&e_path).ok()?;
+        let energy_mj = content.trim().split_whitespace().next()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+        if prev.is_none() {
+            return None; // first sample: just cache
+        }
+        let prev = prev.as_ref().unwrap();
+        let delta_mj = if energy_mj >= prev.energy_mj {
+            energy_mj - prev.energy_mj
+        } else {
+            // Counter wrapped.
+            u64::MAX - prev.energy_mj + energy_mj
+        };
+        let delta_s = now.duration_since(prev.ts).as_secs_f32();
+        if delta_s < 0.05 {
+            return None;
+        }
+        Some(delta_mj as f32 / delta_s) // mW
+    }
+
+    /// Intel GPUs via xpu-smi, with sysfs patching for fields that return
+    /// N/A on the Arc B70: utilization, power draw, and temperature.
+    ///
+    /// xpu-smi --query-gpu returns "N/A" for name, utilization.gpu,
+    /// power.draw, temperature.gpu, and fan.speed on Arc B70.  We patch:
+    /// - name   from xpu-smi --list-gpus
+    /// - util   from gtidle/idle_residency_ms (delta-based)
+    /// - power  from energy1_input (delta-based)
+    /// - temp   from hwmon/temp2_input (pkg sensor)
+    /// - fan    from hwmon/fan1_input (already handled by parse_xpu_csv)
     fn collect_xpu() -> Result<Vec<GpuStats>, String> {
-        run_smi("xpu-smi", XPU_QUERY).map(|out| parse_xpu_csv(&out))
+        // Delta-based util/power need the previous sample.
+        static PREV: std::sync::Mutex<Option<XeSample>> = std::sync::Mutex::new(None);
+        let now = Instant::now();
+
+        // Read current gtidle and energy for caching.
+        let map = Self::xe_bdf_map();
+        let (bfs, sample) = if !map.is_empty() {
+            // Pick the first BDF (they're all the same card for Arc B70;
+            // the single B70 exposes 2 xpu-smi indices = 2 GTs).
+            let bdf = map.values().next().cloned().unwrap_or_default();
+            let tile0 = Path::new("/sys/bus/pci/devices")
+                .join(&bdf)
+                .join("tile0");
+            let mut idle_ms: u64 = 0;
+            for gt_dir in ["gt0", "gt1"] {
+                let p = tile0.join(gt_dir).join("gtidle/idle_residency_ms");
+                if let Ok(s) = std::fs::read_to_string(p) {
+                    idle_ms += s.trim().split_whitespace().next()
+                        .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                }
+            }
+            let hwmon = Path::new("/sys/bus/pci/devices")
+                .join(&bdf)
+                .join("hwmon");
+            // Find the xe hwmonN subdirectory and read energy1_input.
+            let energy_mj = std::fs::read_dir(&hwmon)
+                .ok()
+                .and_then(|dir| {
+                    dir.filter_map(|e| e.ok())
+                        .find(|entry| {
+                            std::fs::read_to_string(entry.path().join("name"))
+                                .ok()
+                                .map(|n| n.trim() == "xe")
+                                .unwrap_or(false)
+                        })
+                        .map(|entry| entry.path().join("energy1_input"))
+                })
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().split_whitespace().next()
+                    .and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(0);
+            (Some(bdf), Some(XeSample {
+                idle_ms,
+                energy_mj,
+                ts: now,
+            }))
+        } else {
+            (None, None)
+        };
+
+        run_smi("xpu-smi", XPU_QUERY).map(|out| {
+            let mut stats = parse_xpu_csv(&out);
+            let names = Self::xpu_gpu_names();
+            let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
+
+            for g in &mut stats {
+                // 1. Patch name.
+                if g.name == "N/A" {
+                    if let Some(real) = names.get(&g.index) {
+                        g.name = real.clone();
+                    }
+                }
+                // 2. Patch temperature from hwmon temp2_input (pkg).
+                if g.temperature.is_none() || g.temperature == Some(0.0) {
+                    if let Some(t) = Self::xe_temp_c(g.index) {
+                        g.temperature = Some(t);
+                    }
+                }
+                // 3. Patch utilization from gtidle.
+                if g.utilization_gpu < 1.0 {
+                    if bfs.is_some() {
+                        let util = Self::xe_utilization_gtidle(g.index, &prev, now);
+                        if let Some(u) = util {
+                            if u > 1.0 {
+                                g.utilization_gpu = u;
+                                g.util_estimated = true;
+                            }
+                        }
+                    }
+                }
+                // 4. Patch power from energy deltas.
+                if g.power_watts < 0.5 {
+                    if let Some(pw) = Self::xe_power_watts(g.index, &prev, now) {
+                        if pw > 0.5 {
+                            g.power_watts = pw / 1000.0; // mW → W
+                        }
+                    }
+                }
+            }
+
+            // Cache the current sample for the next poll.
+            if let Some(s) = sample {
+                *prev = Some(s);
+            }
+            stats
+        })
     }
 
     /// Single-shot collect for initial stats.
@@ -530,56 +850,186 @@ fn parse_xpu_csv(text: &str) -> Vec<GpuStats> {
 }
 
 impl GpuBackend {
+    /// Detect every GPU backend the host supports, then collect from **all
+    /// of them** instead of picking just one. Index assignment order is
+    /// NVML → nvidia-smi → xpu → amd → apple, so a mixed host with both
+    /// NVIDIA and Intel maps cleanly to sequential indices 0, 1, 2, …
     pub fn detect(nvml: Option<Arc<NvmlSession>>) -> Self {
-        if let Some(session) = nvml {
+        // --- NVIDIA: NVML first, then nvidia-smi ---
+        let nvml = if let Some(session) = nvml {
             // A session that cannot reach a side-by-side legacy driver (its
             // NVML loader was never built) would hide those GPUs; nvidia-smi
             // reaches both through the shim.
             if session.covers_all_drivers()
                 && session.collect_stats().is_ok_and(|gpus| !gpus.is_empty())
             {
-                return Self::Nvml(session);
-            }
-        }
-        if GpuMonitor::collect_nvidia().is_ok_and(|gpus| !gpus.is_empty()) {
-            Self::NvidiaSmi
-        } else if GpuMonitor::collect_xpu().is_ok_and(|gpus| !gpus.is_empty()) {
-            Self::Xpu
-        } else if is_apple_silicon() {
-            // termmon's detection: arm64 Apple Silicon (hw.optional.arm64).
-            // Checked before AMD because Apple has no AMD GPUs and Apple
-            // Silicon machines are the only Macs still shipping.
-            Self::Apple(apple_source())
-        } else {
-            let devices = amd_devices();
-            if devices.is_empty() {
-                // Preserve nvidia-smi's useful error when no backend exists.
-                Self::NvidiaSmi
+                Some(session)
             } else {
-                Self::Amd(devices)
+                None
+            }
+        } else {
+            None
+        };
+        let nvidia_smi = if nvml.is_none() {
+            GpuMonitor::collect_nvidia().is_ok_and(|gpus| !gpus.is_empty())
+        } else {
+            false
+        };
+
+        // --- Intel xe driver (independent of NVIDIA — can coexist) ---
+        let xpu = GpuMonitor::collect_xpu()
+            .is_ok_and(|gpus| !gpus.is_empty());
+
+        // --- AMD (independent — can coexist with NVIDIA or Intel) ---
+        let amd_devices = amd_devices();
+        let amd = if amd_devices.is_empty() && nvidia_smi == false && nvml.is_none() && xpu == false {
+            // No backend at all: keep NvidiaSmi so the status line prints
+            // the nvidia-smi error instead of an empty panel.
+            Vec::new()
+        } else {
+            amd_devices
+        };
+
+        // --- Apple Silicon ---
+        // Checked before AMD because Apple has no AMD GPUs and Apple
+        // Silicon machines are the only Macs still shipping.
+        let apple = if is_apple_silicon() {
+            Some(apple_source())
+        } else {
+            None
+        };
+
+        Self {
+            nvml,
+            nvidia_smi,
+            xpu,
+            amd,
+            apple,
+        }
+    }
+
+    /// Return a combined label for the status line: "nvml", "nvml+xpu", etc.
+    pub fn name(&self) -> &'static str {
+        let mut parts: Vec<&'static str> = Vec::new();
+        if self.nvml.is_some() {
+            parts.push("nvml");
+        } else if self.nvidia_smi {
+            parts.push("smi");
+        }
+        if self.xpu {
+            parts.push("xpu");
+        }
+        if !self.amd.is_empty() {
+            parts.push("amd");
+        }
+        if self.apple.is_some() {
+            parts.push("apple");
+        }
+        match parts.as_slice() {
+            [] => "none",
+            [s] => *s,
+            _ => {
+                // Return a static label for mixed configurations.
+                // The exact string is cosmetic; the panel shows the count.
+                "mixed"
             }
         }
     }
 
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Nvml(_) => "nvml",
-            Self::NvidiaSmi => "smi",
-            Self::Xpu => "xpu",
-            Self::Amd(_) => "amd",
-            Self::Apple(_) => "apple",
-        }
-    }
-
+    /// Collect from **all** available backends, merging their GPU rows.
+    /// Indices are assigned sequentially: the first backend's GPUs start
+    /// at 0, the next start at the first's count, and so on. A single
+    /// backend failure does not drop the other backends' GPUs — only if
+    /// *every* backend fails do we return an error.
     pub fn collect(&self) -> Result<Vec<GpuStats>, String> {
-        match self {
-            Self::Nvml(session) => session.collect_stats(),
-            Self::NvidiaSmi => GpuMonitor::collect_nvidia(),
-            Self::Xpu => GpuMonitor::collect_xpu(),
-            Self::Amd(devices) => collect_amd(devices),
-            // `collect_apple` is macOS-only; off macOS it is a stub that
-            // errors, so Linux/Windows never see the Apple code path.
-            Self::Apple(source) => collect_apple(*source),
+        let mut all: Vec<GpuStats> = Vec::new();
+        let mut first_err: Option<String> = None;
+
+        // 1. NVML (NVIDIA)
+        if let Some(session) = &self.nvml {
+            match session.collect_stats() {
+                Ok(mut stats) => {
+                    let off = all.len() as u32;
+                    for g in &mut stats {
+                        g.index += off;
+                    }
+                    all.append(&mut stats);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+
+        // 2. nvidia-smi fallback (NVIDIA)
+        if self.nvidia_smi {
+            match GpuMonitor::collect_nvidia() {
+                Ok(mut stats) => {
+                    let off = all.len() as u32;
+                    for g in &mut stats {
+                        g.index += off;
+                    }
+                    all.append(&mut stats);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+
+        // 3. Intel xe driver
+        if self.xpu {
+            match GpuMonitor::collect_xpu() {
+                Ok(mut stats) => {
+                    let off = all.len() as u32;
+                    for g in &mut stats {
+                        g.index += off;
+                    }
+                    all.append(&mut stats);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+
+        // 4. AMD
+        if !self.amd.is_empty() {
+            match collect_amd(&self.amd) {
+                Ok(mut stats) => {
+                    let off = all.len() as u32;
+                    for g in &mut stats {
+                        g.index += off;
+                    }
+                    all.append(&mut stats);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+
+        // 5. Apple Silicon
+        if let Some(source) = self.apple {
+            match collect_apple(source) {
+                Ok(mut stats) => {
+                    let off = all.len() as u32;
+                    for g in &mut stats {
+                        g.index += off;
+                    }
+                    all.append(&mut stats);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+
+        // Only error if nothing produced any rows.
+        if all.is_empty() {
+            Err(first_err.unwrap_or_else(|| "no supported GPU backend".into()))
+        } else {
+            Ok(all)
         }
     }
 }
@@ -1470,7 +1920,7 @@ pub fn print_gpu_once(as_json: bool) -> bool {
     // closes. A row that never arrives is a real, reportable failure. Every
     // other backend answers its first poll, with rows or with its error.
     let backend = GpuBackend::detect(NvmlSession::new());
-    let polls = if matches!(backend, GpuBackend::Apple(_)) {
+    let polls = if backend.apple.is_some() {
         40
     } else {
         1
@@ -2905,5 +3355,64 @@ mod live_apple_tests {
         let g = &stats[0];
         assert!(g.name.starts_with("Apple "));
         assert!(g.mem_total_mb > 0, "macmon should report the unified pool");
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod live_test {
+    use super::*;
+    
+    #[test]
+    fn test_live_xpu_parse() {
+        let output = std::process::Command::new("xpu-smi")
+            .args(["--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu,clocks.current.graphics,clocks.max.graphics,clocks.current.media,fan.speed,pcie.link.gen.current,pcie.link.width.current", "--format=csv,noheader,nounits"])
+            .output()
+            .expect("xpu-smi failed");
+        assert!(output.status.success(), "xpu-smi exit: {}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("xpu-smi stdout:");
+        for line in stdout.lines() {
+            eprintln!("  [{}]", line.trim());
+        }
+        let stats = parse_xpu_csv(&stdout);
+        for s in &stats {
+            eprintln!("G{}: name={}, mem={}/{}MB, util={:.1}%, power={:.1}W, temp={:?}, clock={}MHz",
+                s.index, s.name, s.mem_used_mb, s.mem_total_mb,
+                s.utilization_gpu, s.power_watts, s.temperature,
+                s.clock_sm_mhz);
+        }
+        assert!(!stats.is_empty(), "Expected at least one GPU from xpu-smi");
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod live_test_names {
+    use super::*;
+
+    #[test]
+    fn test_xpu_gpu_names_live() {
+        // xpu-smi --list-gpus returns N/A for names on Arc B70;
+        // the function uses --query-gpu + discovery to get real names.
+        let names = GpuMonitor::xpu_gpu_names();
+        for (idx, name) in &names {
+            eprintln!("G{} -> {}", idx, name);
+            // Both B70 indices should have names from discovery.
+            assert!(!name.is_empty(),
+                "G{} should have a name from xpu-smi discovery",
+                idx);
+        }
+    }
+
+    #[test]
+    fn test_xpu_sysfs_read_live() {
+        // Verify we can read xe sysfs data: BDF map, temperature, fan.
+        let map = GpuMonitor::xe_bdf_map();
+        eprintln!("xe BDF map: {:?}", map);
+        let temp = GpuMonitor::xe_temp_c(0);
+        eprintln!("G0 temp: {:?} °C", temp);
+        let fan = xe_fan_rpm_by_index();
+        eprintln!("xe fan RPMs: {:?}", fan);
     }
 }

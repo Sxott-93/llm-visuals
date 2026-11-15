@@ -1030,10 +1030,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             nvml::NvmlSession::new()
         };
         let backend = Arc::new(GpuBackend::detect(nvml));
-        let nvml_host = match backend.as_ref() {
-            GpuBackend::Nvml(session) => Some(session.clone()),
-            _ => None,
-        };
+        let nvml_host = backend.nvml.as_ref().map(|s| s.clone());
         let name = backend.name();
         (Some(backend), nvml_host, name)
     };
